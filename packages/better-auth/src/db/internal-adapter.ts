@@ -8,18 +8,18 @@ import type {
 } from "@better-auth/core";
 import {
 	getCurrentAdapter,
-	getCurrentAuthContext,
+	getCurrentAuthEndpointContext,
 	queueAfterTransactionHook,
 	runWithTransaction,
+	tryGetCurrentAuthEndpointContext,
 } from "@better-auth/core/context";
-import { createLocalAccountIssuer } from "@better-auth/core/db";
 import type { DBAdapter, Where } from "@better-auth/core/db/adapter";
+import { encodeDeterministicId } from "@better-auth/core/db/internal";
 import type { InternalLogger } from "@better-auth/core/env";
 import { APIError, BetterAuthError } from "@better-auth/core/error";
 import { generateId } from "@better-auth/core/utils/id";
 import { getIP } from "@better-auth/core/utils/ip";
 import { safeJSONParse } from "@better-auth/core/utils/json";
-import { base64Url } from "@better-auth/utils/base64";
 import { createHash } from "@better-auth/utils/hash";
 import type { Account, Session, User, Verification } from "../types";
 import { getDate } from "../utils/date";
@@ -288,7 +288,7 @@ export const createInternalAdapter = (
 				let endpointContext: GenericEndpointContext;
 				try {
 					endpointContext =
-						(await getCurrentAuthContext()) as GenericEndpointContext;
+						getCurrentAuthEndpointContext() as GenericEndpointContext;
 				} catch (error) {
 					logger.error(
 						"Unable to run validateUserInfo: missing endpoint context",
@@ -473,7 +473,7 @@ export const createInternalAdapter = (
 				| undefined,
 		) => {
 			const headers: Headers | undefined = await (async () => {
-				const ctx = await getCurrentAuthContext().catch(() => null);
+				const ctx = tryGetCurrentAuthEndpointContext();
 				return ctx?.headers || ctx?.request?.headers;
 			})();
 			const storeInDb = options.session?.storeSessionInDatabase;
@@ -999,25 +999,32 @@ export const createInternalAdapter = (
 				undefined,
 			);
 		},
-		findAccountOwnerByKey: async ({ issuer, accountId }) => {
-			const accountWithUser = await (await getCurrentAdapter(adapter)).findOne<
-				Account & { user: User | null }
-			>({
+		findAccountOwnerByKey: async ({ providerId, accountId }) => {
+			const accountsWithUsers = await (
+				await getCurrentAdapter(adapter)
+			).findMany<Account & { user: User | null }>({
 				model: "account",
 				where: [
 					{
-						field: "issuer",
-						value: issuer,
+						field: "providerId",
+						value: providerId,
 					},
 					{
 						field: "accountId",
 						value: accountId,
 					},
 				],
+				limit: 2,
 				join: {
 					user: true,
 				},
 			});
+			if (accountsWithUsers.length > 1) {
+				throw new BetterAuthError(
+					`Multiple accounts match the same accountId for provider ${JSON.stringify(providerId)}. Resolve duplicate account identities before continuing.`,
+				);
+			}
+			const accountWithUser = accountsWithUsers[0];
 			if (!accountWithUser) return null;
 			const { user, ...account } = accountWithUser;
 			return user
@@ -1150,10 +1157,6 @@ export const createInternalAdapter = (
 						value: "credential",
 					},
 					{
-						field: "issuer",
-						value: createLocalAccountIssuer("credential"),
-					},
-					{
 						field: "accountId",
 						value: userId,
 					},
@@ -1182,31 +1185,33 @@ export const createInternalAdapter = (
 				where: [
 					{ field: "userId", value: userId },
 					{ field: "providerId", value: "credential" },
-					{
-						field: "issuer",
-						value: createLocalAccountIssuer("credential"),
-					},
 					{ field: "accountId", value: userId },
 				],
 			});
 		},
-		findAccountByKey: async ({ issuer, accountId }) => {
-			const account = await (await getCurrentAdapter(adapter)).findOne<Account>(
-				{
-					model: "account",
-					where: [
-						{
-							field: "issuer",
-							value: issuer,
-						},
-						{
-							field: "accountId",
-							value: accountId,
-						},
-					],
-				},
-			);
-			return account;
+		findAccountByKey: async ({ providerId, accountId }) => {
+			const accounts = await (
+				await getCurrentAdapter(adapter)
+			).findMany<Account>({
+				model: "account",
+				limit: 2,
+				where: [
+					{
+						field: "providerId",
+						value: providerId,
+					},
+					{
+						field: "accountId",
+						value: accountId,
+					},
+				],
+			});
+			if (accounts.length > 1) {
+				throw new BetterAuthError(
+					`Multiple accounts match the same accountId for provider ${JSON.stringify(providerId)}. Resolve duplicate account identities before continuing.`,
+				);
+			}
+			return accounts[0] ?? null;
 		},
 		findAccountByUserId: async (userId: string) => {
 			const account = await (
@@ -1509,7 +1514,9 @@ export const createInternalAdapter = (
 		 * already taken.
 		 *
 		 * The `verification.identifier` column is non-unique, so uniqueness comes
-		 * from a deterministic primary key (`SHA-256` of `reserve:<identifier>`).
+		 * from a deterministic primary key (`SHA-256` of `reserve:<identifier>`,
+		 * encoded by `encodeDeterministicId` so the configured id strategy keeps
+		 * it; see its note on `generateId: "serial"`).
 		 * The database path is atomic: the primary key turns the INSERT into the
 		 * first-writer-wins gate, and a duplicate is detected portably by
 		 * re-reading the row rather than matching adapter-specific errors.
@@ -1527,13 +1534,13 @@ export const createInternalAdapter = (
 			value: string;
 			expiresAt: Date;
 		}): Promise<boolean> => {
-			const reservationId = base64Url.encode(
+			const reservationId = encodeDeterministicId(
 				new Uint8Array(
 					await createHash("SHA-256").digest(
 						new TextEncoder().encode("reserve:" + data.identifier),
 					),
 				),
-				{ padding: false },
+				options,
 			);
 			const storageOption = getStorageOption(
 				data.identifier,
